@@ -2,6 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 type Phase = 'upload' | 'ready' | 'converting' | 'done' | 'error'
 
+interface VideoInfo {
+  width: number | null
+  height: number | null
+  fps: number
+  codec: string | null
+  duration: number
+  size: number
+}
+
 // 로그 스케일: 슬라이더 0~1 → 0.1x~1000x
 const MIN_SPEED = 0.1
 const MAX_SPEED = 1000
@@ -20,8 +29,23 @@ function formatSpeed(speed: number): string {
   return speed.toFixed(3).replace(/\.?0+$/, '')
 }
 
+function formatDuration(secs: number): string {
+  const h = Math.floor(secs / 3600)
+  const m = Math.floor((secs % 3600) / 60)
+  const s = Math.floor(secs % 60)
+  return [h, m, s].map((v) => String(v).padStart(2, '0')).join(':')
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+}
+
 const PRESETS = [0.25, 0.5, 1, 2, 4, 8, 16, 32, 100]
 const ACCEPTED_TYPES = /\.(mp4|mov|avi|mkv|webm|flv|wmv|m4v|ts|mts)$/i
+const OUTPUT_FORMATS = ['mp4', 'mov', 'webm'] as const
+type OutputFormat = (typeof OUTPUT_FORMATS)[number]
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>('upload')
@@ -33,6 +57,17 @@ export default function App() {
   const [progress, setProgress] = useState<number>(0)
   const [error, setError] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  // A: 비디오 정보
+  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null)
+  // D: 구간 선택
+  const [trimStart, setTrimStart] = useState<number>(0)
+  const [trimEnd, setTrimEnd] = useState<number>(0)
+  // E: CRF
+  const [crf, setCrf] = useState<number>(23)
+  // F: 출력 포맷
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>('mp4')
+  // 고급 옵션 접기/펼치기
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -90,6 +125,25 @@ export default function App() {
     }
   }
 
+  const handleReset = () => {
+    eventSourceRef.current?.close()
+    if (videoUrl) URL.revokeObjectURL(videoUrl)
+    setPhase('upload')
+    setFile(null)
+    setVideoUrl(null)
+    setJobId(null)
+    setProgress(0)
+    setError(null)
+    setSpeed(2)
+    setSpeedInput('2')
+    setVideoInfo(null)
+    setTrimStart(0)
+    setTrimEnd(0)
+    setCrf(23)
+    setOutputFormat('mp4')
+    setShowAdvanced(false)
+  }
+
   const handleConvert = async () => {
     if (!file) return
     setPhase('converting')
@@ -99,6 +153,10 @@ export default function App() {
     const formData = new FormData()
     formData.append('file', file)
     formData.append('speed', speed.toString())
+    formData.append('trim_start', trimStart.toString())
+    formData.append('trim_end', trimEnd.toString())
+    formData.append('crf', crf.toString())
+    formData.append('output_format', outputFormat)
 
     try {
       const res = await fetch('/api/convert', { method: 'POST', body: formData })
@@ -106,23 +164,27 @@ export default function App() {
         const err = await res.json()
         throw new Error(err.detail || '업로드 실패')
       }
-      const { job_id } = await res.json()
-      setJobId(job_id)
+      const data = await res.json()
+      setJobId(data.job_id)
+      if (data.video_info) setVideoInfo(data.video_info)
 
       // SSE로 진행률 수신
-      const es = new EventSource(`/api/progress/${job_id}`)
+      const es = new EventSource(`/api/progress/${data.job_id}`)
       eventSourceRef.current = es
 
       es.onmessage = (event) => {
-        const data = JSON.parse(event.data)
-        setProgress(data.progress ?? 0)
-        if (data.status === 'done') {
+        const d = JSON.parse(event.data)
+        setProgress(d.progress ?? 0)
+        if (d.status === 'done') {
           es.close()
           setPhase('done')
-        } else if (data.status === 'error') {
+        } else if (d.status === 'cancelled') {
+          es.close()
+          handleReset()
+        } else if (d.status === 'error') {
           es.close()
           setPhase('error')
-          setError(data.error ?? '변환 중 오류가 발생했습니다.')
+          setError(d.error ?? '변환 중 오류가 발생했습니다.')
         }
       }
       es.onerror = () => {
@@ -136,21 +198,28 @@ export default function App() {
     }
   }
 
-  const handleDownload = () => {
-    if (jobId) window.open(`/api/download/${jobId}`, '_blank')
+  // B: 변환 취소
+  const handleCancel = () => {
+    if (!jobId) return
+    fetch(`/api/cancel/${jobId}`, { method: 'DELETE' }).catch(() => {})
+    handleReset()
   }
 
-  const handleReset = () => {
-    eventSourceRef.current?.close()
-    if (videoUrl) URL.revokeObjectURL(videoUrl)
-    setPhase('upload')
-    setFile(null)
-    setVideoUrl(null)
-    setJobId(null)
-    setProgress(0)
-    setError(null)
-    setSpeed(2)
-    setSpeedInput('2')
+  // C: 다운로드 후 서버 파일 자동 정리
+  const handleDownload = async () => {
+    if (!jobId) return
+    const res = await fetch(`/api/download/${jobId}`)
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const disposition = res.headers.get('content-disposition') ?? ''
+    const match = disposition.match(/filename="?([^"]+)"?/)
+    const filename = match ? match[1] : `output.${outputFormat}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+    fetch(`/api/cleanup/${jobId}`, { method: 'DELETE' }).catch(() => {})
   }
 
   return (
@@ -219,6 +288,37 @@ export default function App() {
               </button>
             </div>
 
+            {/* A: 비디오 정보 뱃지 */}
+            {videoInfo && (
+              <div className="flex flex-wrap gap-2">
+                {videoInfo.width && videoInfo.height && (
+                  <span className="text-xs px-2.5 py-1 bg-slate-700 text-slate-300 rounded-full">
+                    {videoInfo.width}×{videoInfo.height}
+                  </span>
+                )}
+                {videoInfo.fps > 0 && (
+                  <span className="text-xs px-2.5 py-1 bg-slate-700 text-slate-300 rounded-full">
+                    {Number.isInteger(videoInfo.fps) ? videoInfo.fps : videoInfo.fps.toFixed(2)}fps
+                  </span>
+                )}
+                {videoInfo.codec && (
+                  <span className="text-xs px-2.5 py-1 bg-slate-700 text-slate-300 rounded-full uppercase">
+                    {videoInfo.codec}
+                  </span>
+                )}
+                {videoInfo.duration > 0 && (
+                  <span className="text-xs px-2.5 py-1 bg-slate-700 text-slate-300 rounded-full">
+                    {formatDuration(videoInfo.duration)}
+                  </span>
+                )}
+                {videoInfo.size > 0 && (
+                  <span className="text-xs px-2.5 py-1 bg-slate-700 text-slate-300 rounded-full">
+                    {formatFileSize(videoInfo.size)}
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* 비디오 미리보기 */}
             <div className="rounded-xl overflow-hidden bg-black aspect-video">
               <video
@@ -227,6 +327,65 @@ export default function App() {
                 controls
                 className="w-full h-full object-contain"
               />
+            </div>
+
+            {/* D: 구간 선택 */}
+            <div className="space-y-3 px-1">
+              <p className="text-slate-300 font-medium text-sm">구간 선택 <span className="text-slate-500 font-normal">(선택 사항)</span></p>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-slate-400 text-xs mb-1.5 block">시작 (초)</label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      min={0}
+                      max={videoInfo?.duration ?? undefined}
+                      step={0.1}
+                      value={trimStart || ''}
+                      placeholder="0"
+                      onChange={(e) => setTrimStart(parseFloat(e.target.value) || 0)}
+                      className="flex-1 bg-slate-700 text-white text-sm px-3 py-2 rounded-lg border border-slate-600 focus:border-blue-500 focus:outline-none"
+                    />
+                    <button
+                      onClick={() => setTrimStart(Math.round((videoRef.current?.currentTime ?? 0) * 10) / 10)}
+                      title="현재 재생 위치로 설정"
+                      className="px-2.5 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs rounded-lg border border-slate-600 transition-colors"
+                    >
+                      현재
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label className="text-slate-400 text-xs mb-1.5 block">종료 (초, 0 = 끝까지)</label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      min={0}
+                      max={videoInfo?.duration ?? undefined}
+                      step={0.1}
+                      value={trimEnd || ''}
+                      placeholder="끝까지"
+                      onChange={(e) => setTrimEnd(parseFloat(e.target.value) || 0)}
+                      className="flex-1 bg-slate-700 text-white text-sm px-3 py-2 rounded-lg border border-slate-600 focus:border-blue-500 focus:outline-none"
+                    />
+                    <button
+                      onClick={() => setTrimEnd(Math.round((videoRef.current?.currentTime ?? 0) * 10) / 10)}
+                      title="현재 재생 위치로 설정"
+                      className="px-2.5 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs rounded-lg border border-slate-600 transition-colors"
+                    >
+                      현재
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {(trimStart > 0 || trimEnd > 0) && (
+                <p className="text-slate-500 text-xs">
+                  {formatDuration(trimStart)} ~ {trimEnd > 0 ? formatDuration(trimEnd) : (videoInfo ? formatDuration(videoInfo.duration) : '끝')}
+                  {trimEnd > trimStart && trimEnd > 0 && (
+                    <span className="ml-2 text-blue-400">({formatDuration(trimEnd - trimStart)} 구간)</span>
+                  )}
+                </p>
+              )}
             </div>
 
             {/* 속도 컨트롤 */}
@@ -296,6 +455,69 @@ export default function App() {
               )}
             </div>
 
+            {/* E + F: 고급 옵션 */}
+            <div className="px-1">
+              <button
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="flex items-center gap-2 text-slate-400 hover:text-slate-200 text-sm transition-colors"
+              >
+                <span
+                  className="inline-block transition-transform duration-200"
+                  style={{ transform: showAdvanced ? 'rotate(90deg)' : 'rotate(0deg)' }}
+                >
+                  ▶
+                </span>
+                고급 옵션
+              </button>
+
+              {showAdvanced && (
+                <div className="mt-4 space-y-5 pl-4 border-l border-slate-700">
+                  {/* F: 출력 포맷 */}
+                  <div>
+                    <p className="text-slate-400 text-xs mb-2">출력 포맷</p>
+                    <div className="flex gap-2">
+                      {OUTPUT_FORMATS.map((fmt) => (
+                        <button
+                          key={fmt}
+                          onClick={() => setOutputFormat(fmt)}
+                          className={`px-5 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                            outputFormat === fmt
+                              ? 'bg-blue-600 text-white shadow-md shadow-blue-500/30'
+                              : 'bg-slate-700 text-slate-300 hover:bg-slate-600 hover:text-white'
+                          }`}
+                        >
+                          {fmt.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* E: CRF 슬라이더 */}
+                  <div>
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="text-slate-400 text-xs">화질 조절</p>
+                      <span className="text-slate-300 text-xs font-mono bg-slate-700 px-2 py-0.5 rounded">
+                        CRF {crf}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={51}
+                      step={1}
+                      value={crf}
+                      onChange={(e) => setCrf(parseInt(e.target.value))}
+                      className="w-full"
+                    />
+                    <div className="flex justify-between text-xs text-slate-600 mt-1">
+                      <span>고화질 (큰 파일)</span>
+                      <span>저화질 (작은 파일)</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* 변환 버튼 */}
             <button
               onClick={handleConvert}
@@ -331,6 +553,14 @@ export default function App() {
                 />
               </div>
             </div>
+
+            {/* B: 취소 버튼 */}
+            <button
+              onClick={handleCancel}
+              className="px-6 py-2.5 bg-slate-700 hover:bg-red-600/80 text-slate-300 hover:text-white font-medium rounded-xl transition-all duration-200"
+            >
+              취소
+            </button>
 
             <p className="text-slate-600 text-xs">
               브라우저를 닫지 마세요 — 서버에서 FFmpeg로 처리 중입니다.
