@@ -22,7 +22,8 @@ if [ ! -d ".venv" ]; then
   python3 -m venv .venv
 fi
 source .venv/bin/activate
-pip install -r requirements.txt -q
+# pip 설치 (시스템 패키지 의존성 경고는 우리 앱과 무관하므로 필터링)
+pip install -r requirements.txt -q 2>&1 | grep -v "dependency resolver" | grep -v "^\s*$" || true
 
 uvicorn main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
