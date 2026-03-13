@@ -133,6 +133,90 @@ def parse_time_to_seconds(time_str: str) -> float:
     return 0.0
 
 
+def _build_ffmpeg_cmd(
+    input_path: str,
+    output_path: str,
+    speed: float,
+    trim_start: float,
+    trim_end: float,
+    crf: int,
+    output_format: str,
+    crop_x: int,
+    crop_y: int,
+    crop_w: int,
+    crop_h: int,
+    input_fps: float,
+    use_blend: bool,
+) -> list[str]:
+    """FFmpeg 명령어 리스트를 생성한다.
+
+    use_blend=True 이면 tmix/minterpolate 블렌딩 필터를 적용하고,
+    False 이면 단순 setpts 방식(폴백)으로 구성한다.
+    """
+    cmd = ["ffmpeg"]
+    if trim_start > 0:
+        cmd.extend(["-ss", str(trim_start)])
+    if trim_end > 0:
+        cmd.extend(["-t", str(trim_end - trim_start)])
+    cmd.extend(["-i", input_path])
+
+    # 비디오 필터 체인: crop → (블렌딩/보간) → setpts → (fps 정규화)
+    vf_chain: list[str] = []
+    if crop_w > 0 and crop_h > 0:
+        vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+
+    if use_blend and speed > 1.0 and speed <= 100 and input_fps > 0:
+        # tmix: weights 미지정 시 기본값 전부 1 (공백/따옴표 파싱 문제 회피)
+        blend_n = min(32, max(2, round(speed)))
+        vf_chain.append(f"tmix=frames={blend_n}")
+        vf_chain.append(f"setpts=PTS/{speed}")
+    elif use_blend and speed < 1.0 and input_fps > 0:
+        target_fps = min(120, max(round(input_fps / speed), round(input_fps) * 2))
+        vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=blend")
+        vf_chain.append(f"setpts=PTS/{speed}")
+        vf_chain.append(f"fps={round(input_fps)}")
+    else:
+        vf_chain.append(f"setpts=PTS/{speed}")
+
+    cmd.extend(["-vf", ",".join(vf_chain)])
+
+    if speed > 100:
+        cmd.append("-an")
+    else:
+        cmd.extend(["-af", build_atempo_filter(speed)])
+
+    if output_format == "webm":
+        cmd.extend(["-c:v", "libvpx-vp9", "-b:v", "0", "-c:a", "libopus"])
+
+    cmd.extend(["-crf", str(crf)])
+    cmd.extend(["-y", output_path])
+    return cmd
+
+
+def _run_ffmpeg_process(job_id: str, cmd: list[str], output_duration: float) -> int:
+    """FFmpeg 프로세스를 실행하고 진행률을 추적한다. returncode를 반환."""
+    process = subprocess.Popen(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    jobs[job_id]["process"] = process
+
+    time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d+)")
+
+    assert process.stderr is not None
+    for line in process.stderr:
+        match = time_pattern.search(line)
+        if match and output_duration > 0:
+            current = parse_time_to_seconds(match.group(1))
+            jobs[job_id]["progress"] = min(99, int(current / output_duration * 100))
+
+    process.wait()
+    return process.returncode
+
+
 def run_ffmpeg(
     job_id: str,
     input_path: str,
@@ -146,75 +230,39 @@ def run_ffmpeg(
     crop_y: int = 0,
     crop_w: int = 0,
     crop_h: int = 0,
+    input_fps: float = 0.0,
 ) -> None:
     try:
         input_duration = get_video_duration(input_path)
         clip_duration = (trim_end - trim_start) if trim_end > 0 else input_duration
         output_duration = clip_duration / speed if speed > 0 else clip_duration
 
-        # -ss/-t 를 -i 앞(입력 옵션)으로 배치
-        # -ss: 빠른 keyframe seek / -t: 입력 자체를 잘라내어 이후 속도 필터와 독립적으로 동작
-        cmd = ["ffmpeg"]
-        if trim_start > 0:
-            cmd.extend(["-ss", str(trim_start)])
-        if trim_end > 0:
-            cmd.extend(["-t", str(trim_end - trim_start)])
-        cmd.extend(["-i", input_path])
-
-        # 비디오 필터 체인: crop(옵션) → setpts(속도)
-        vf_chain: list[str] = []
-        if crop_w > 0 and crop_h > 0:
-            vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
-        vf_chain.append(f"setpts=PTS/{speed}")
-        cmd.extend(["-vf", ",".join(vf_chain)])
-
-        # 100x 초과 시 오디오 제거, 이하에서는 atempo 체인 사용
-        if speed > 100:
-            cmd.append("-an")
-        else:
-            cmd.extend(["-af", build_atempo_filter(speed)])
-
-        # 포맷별 코덱 설정
-        if output_format == "webm":
-            cmd.extend(["-c:v", "libvpx-vp9", "-b:v", "0", "-c:a", "libopus"])
-
-        cmd.extend(["-crf", str(crf)])
-        cmd.extend(["-y", output_path])
-
-        process = subprocess.Popen(
-            cmd,
-            stderr=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
+        build_args = (
+            input_path, output_path, speed, trim_start, trim_end,
+            crf, output_format, crop_x, crop_y, crop_w, crop_h, input_fps,
         )
-        jobs[job_id]["process"] = process
 
-        time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d+)")
+        # 1차 시도: 블렌딩 필터 적용 (tmix / minterpolate)
+        cmd = _build_ffmpeg_cmd(*build_args, use_blend=True)
+        returncode = _run_ffmpeg_process(job_id, cmd, output_duration)
 
-        assert process.stderr is not None
-        for line in process.stderr:
-            match = time_pattern.search(line)
-            if match and output_duration > 0:
-                current = parse_time_to_seconds(match.group(1))
-                jobs[job_id]["progress"] = min(99, int(current / output_duration * 100))
+        # 블렌딩 필터 실패 시 단순 setpts 방식으로 폴백
+        if returncode != 0 and jobs[job_id]["status"] != "cancelled":
+            jobs[job_id]["progress"] = 0
+            cmd = _build_ffmpeg_cmd(*build_args, use_blend=False)
+            returncode = _run_ffmpeg_process(job_id, cmd, output_duration)
 
-        process.wait()
-
-        if process.returncode == 0:
+        if returncode == 0:
             jobs[job_id]["status"] = "done"
             jobs[job_id]["progress"] = 100
             jobs[job_id]["output_path"] = output_path
         elif jobs[job_id]["status"] == "cancelled":
-            # cancel 엔드포인트가 이미 cancelled 로 설정한 경우 덮어쓰지 않음
-            # (FFmpeg는 SIGTERM 수신 시 returncode=255 등 양수로 종료할 수 있음)
             pass
-        elif process.returncode < 0:
-            # Python subprocess가 음수 returncode를 반환하는 경우 (일부 플랫폼)
+        elif returncode < 0:
             jobs[job_id]["status"] = "cancelled"
         else:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "FFmpeg 변환 실패 (returncode={})".format(process.returncode)
+            jobs[job_id]["error"] = "FFmpeg 변환 실패 (returncode={})".format(returncode)
 
     except Exception as exc:
         jobs[job_id]["status"] = "error"
@@ -268,10 +316,12 @@ async def convert_video(
         "created_at": datetime.now(),
     }
 
+    input_fps = video_info.get("fps") or 0.0
+
     thread = threading.Thread(
         target=run_ffmpeg,
         args=(job_id, input_path, output_path, speed, trim_start, trim_end, crf, output_format,
-              crop_x, crop_y, crop_w, crop_h),
+              crop_x, crop_y, crop_w, crop_h, input_fps),
         daemon=True,
     )
     thread.start()
