@@ -142,6 +142,10 @@ def run_ffmpeg(
     trim_end: float = 0.0,
     crf: int = 23,
     output_format: str = "mp4",
+    crop_x: int = 0,
+    crop_y: int = 0,
+    crop_w: int = 0,
+    crop_h: int = 0,
 ) -> None:
     try:
         input_duration = get_video_duration(input_path)
@@ -157,8 +161,12 @@ def run_ffmpeg(
             cmd.extend(["-t", str(trim_end - trim_start)])
         cmd.extend(["-i", input_path])
 
-        video_filter = f"setpts=PTS/{speed}"
-        cmd.extend(["-vf", video_filter])
+        # 비디오 필터 체인: crop(옵션) → setpts(속도)
+        vf_chain: list[str] = []
+        if crop_w > 0 and crop_h > 0:
+            vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+        vf_chain.append(f"setpts=PTS/{speed}")
+        cmd.extend(["-vf", ",".join(vf_chain)])
 
         # 100x 초과 시 오디오 제거, 이하에서는 atempo 체인 사용
         if speed > 100:
@@ -221,6 +229,10 @@ async def convert_video(
     trim_end: float = Form(0.0),
     crf: int = Form(23),
     output_format: str = Form("mp4"),
+    crop_x: int = Form(0),
+    crop_y: int = Form(0),
+    crop_w: int = Form(0),
+    crop_h: int = Form(0),
 ) -> dict:
     if speed <= 0 or speed > 1000:
         raise HTTPException(status_code=400, detail="speed는 0 초과 1000 이하여야 합니다.")
@@ -258,7 +270,8 @@ async def convert_video(
 
     thread = threading.Thread(
         target=run_ffmpeg,
-        args=(job_id, input_path, output_path, speed, trim_start, trim_end, crf, output_format),
+        args=(job_id, input_path, output_path, speed, trim_start, trim_end, crf, output_format,
+              crop_x, crop_y, crop_w, crop_h),
         daemon=True,
     )
     thread.start()

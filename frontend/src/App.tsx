@@ -11,6 +11,13 @@ interface VideoInfo {
   size: number
 }
 
+interface CropRegion {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
 // 로그 스케일: 슬라이더 0~1 → 0.1x~1000x
 const MIN_SPEED = 0.1
 const MAX_SPEED = 1000
@@ -68,10 +75,17 @@ export default function App() {
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('mp4')
   // 고급 옵션 접기/펼치기
   const [showAdvanced, setShowAdvanced] = useState(false)
+  // 크롭
+  const [cropRegion, setCropRegion] = useState<CropRegion | null>(null)
+  const [cropMode, setCropMode] = useState(false)
+  // 드래그 중 화면에 보여줄 사각형 (컨테이너 좌표, px)
+  const [dragRect, setDragRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const eventSourceRef = useRef<EventSource | null>(null)
+  const cropOverlayRef = useRef<HTMLDivElement>(null)
+  const cropDragStartRef = useRef<{ x: number; y: number } | null>(null)
 
   // 미리보기: HTML5 playbackRate 동기화 (브라우저 최대 ~16x)
   useEffect(() => {
@@ -88,6 +102,125 @@ export default function App() {
     }
   }, [videoUrl])
 
+  // cropMode 진입 시 기존 cropRegion을 displayRect로 복원
+  useEffect(() => {
+    if (cropMode && cropRegion) {
+      const dr = cropRegionToDisplayRect(cropRegion)
+      if (dr) setDragRect(dr)
+    }
+  }, [cropMode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── 크롭 좌표 변환 헬퍼 ───────────────────────────────────────────────────
+  // video element는 object-contain이므로 실제 렌더링 영역과 컨테이너가 다를 수 있음
+  const getVideoRenderBounds = () => {
+    const video = videoRef.current
+    if (!video || !video.videoWidth || !video.videoHeight) return null
+    const cW = video.clientWidth
+    const cH = video.clientHeight
+    const vW = video.videoWidth
+    const vH = video.videoHeight
+    const scale = Math.min(cW / vW, cH / vH)
+    const renderedW = vW * scale
+    const renderedH = vH * scale
+    return {
+      scale,
+      offsetX: (cW - renderedW) / 2,
+      offsetY: (cH - renderedH) / 2,
+      renderedW,
+      renderedH,
+    }
+  }
+
+  // 오버레이(컨테이너) 좌표 → 실제 비디오 픽셀 좌표
+  const containerToVideo = (cx: number, cy: number): { x: number; y: number } | null => {
+    const bounds = getVideoRenderBounds()
+    const video = videoRef.current
+    if (!bounds || !video) return null
+    const { scale, offsetX, offsetY } = bounds
+    return {
+      x: Math.round(Math.max(0, Math.min(video.videoWidth,  (cx - offsetX) / scale))),
+      y: Math.round(Math.max(0, Math.min(video.videoHeight, (cy - offsetY) / scale))),
+    }
+  }
+
+  // 실제 비디오 픽셀 좌표 → 오버레이(컨테이너) 좌표
+  const cropRegionToDisplayRect = (cr: CropRegion) => {
+    const bounds = getVideoRenderBounds()
+    if (!bounds) return null
+    const { scale, offsetX, offsetY } = bounds
+    return {
+      x: cr.x * scale + offsetX,
+      y: cr.y * scale + offsetY,
+      w: cr.w * scale,
+      h: cr.h * scale,
+    }
+  }
+
+  // ─── 크롭 드래그 핸들러 ────────────────────────────────────────────────────
+  const getOverlayRelativePos = (e: React.MouseEvent) => {
+    const overlay = cropOverlayRef.current
+    if (!overlay) return null
+    const rect = overlay.getBoundingClientRect()
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  }
+
+  const handleCropMouseDown = (e: React.MouseEvent) => {
+    const pos = getOverlayRelativePos(e)
+    if (!pos) return
+    cropDragStartRef.current = pos
+    setDragRect({ x: pos.x, y: pos.y, w: 0, h: 0 })
+  }
+
+  const handleCropMouseMove = (e: React.MouseEvent) => {
+    if (!cropDragStartRef.current) return
+    const pos = getOverlayRelativePos(e)
+    if (!pos) return
+    const { x: sx, y: sy } = cropDragStartRef.current
+    setDragRect({
+      x: Math.min(sx, pos.x),
+      y: Math.min(sy, pos.y),
+      w: Math.abs(pos.x - sx),
+      h: Math.abs(pos.y - sy),
+    })
+  }
+
+  const handleCropMouseUp = (e: React.MouseEvent) => {
+    if (!cropDragStartRef.current) return
+    const pos = getOverlayRelativePos(e)
+    cropDragStartRef.current = null
+    if (!pos) return
+
+    const rect = dragRect
+    if (!rect || rect.w < 5 || rect.h < 5) {
+      // 너무 작은 드래그는 무시
+      return
+    }
+
+    // 컨테이너 좌표 → 비디오 픽셀 좌표 변환
+    const topLeft     = containerToVideo(rect.x,          rect.y)
+    const bottomRight = containerToVideo(rect.x + rect.w, rect.y + rect.h)
+    if (topLeft && bottomRight) {
+      const newCrop: CropRegion = {
+        x: topLeft.x,
+        y: topLeft.y,
+        w: bottomRight.x - topLeft.x,
+        h: bottomRight.y - topLeft.y,
+      }
+      // FFmpeg crop 홀수 크기 오류 방지: 짝수로 강제
+      newCrop.w = newCrop.w % 2 === 0 ? newCrop.w : newCrop.w - 1
+      newCrop.h = newCrop.h % 2 === 0 ? newCrop.h : newCrop.h - 1
+      if (newCrop.w > 0 && newCrop.h > 0) setCropRegion(newCrop)
+    }
+  }
+
+  const handleCropMouseLeave = () => {
+    // 마우스가 오버레이 밖으로 나가면 드래그 종료
+    if (cropDragStartRef.current) {
+      cropDragStartRef.current = null
+    }
+  }
+
+  // ─── 파일 핸들링 ─────────────────────────────────────────────────────────
   const handleFile = useCallback((f: File) => {
     if (!f.type.startsWith('video/') && !ACCEPTED_TYPES.test(f.name)) {
       setError('비디오 파일만 지원됩니다. (MP4, MOV, AVI, MKV, WebM 등)')
@@ -142,6 +275,9 @@ export default function App() {
     setCrf(23)
     setOutputFormat('mp4')
     setShowAdvanced(false)
+    setCropRegion(null)
+    setCropMode(false)
+    setDragRect(null)
   }
 
   const handleConvert = async () => {
@@ -157,6 +293,12 @@ export default function App() {
     formData.append('trim_end', trimEnd.toString())
     formData.append('crf', crf.toString())
     formData.append('output_format', outputFormat)
+    if (cropRegion) {
+      formData.append('crop_x', cropRegion.x.toString())
+      formData.append('crop_y', cropRegion.y.toString())
+      formData.append('crop_w', cropRegion.w.toString())
+      formData.append('crop_h', cropRegion.h.toString())
+    }
 
     try {
       const res = await fetch('/api/convert', { method: 'POST', body: formData })
@@ -319,14 +461,109 @@ export default function App() {
               </div>
             )}
 
-            {/* 비디오 미리보기 */}
-            <div className="rounded-xl overflow-hidden bg-black aspect-video">
+            {/* 비디오 미리보기 + 크롭 오버레이 */}
+            <div className="rounded-xl overflow-hidden bg-black aspect-video relative">
               <video
                 ref={videoRef}
                 src={videoUrl}
                 controls
                 className="w-full h-full object-contain"
               />
+
+              {/* 크롭 모드 오버레이 */}
+              {cropMode && (
+                <div
+                  ref={cropOverlayRef}
+                  className="absolute inset-0 cursor-crosshair select-none"
+                  onMouseDown={handleCropMouseDown}
+                  onMouseMove={handleCropMouseMove}
+                  onMouseUp={handleCropMouseUp}
+                  onMouseLeave={handleCropMouseLeave}
+                >
+                  {dragRect && dragRect.w > 0 && dragRect.h > 0 ? (
+                    <>
+                      {/* 선택 영역 외부를 어둡게 (box-shadow 트릭) */}
+                      <div
+                        className="absolute border-2 border-blue-400 pointer-events-none"
+                        style={{
+                          left: dragRect.x,
+                          top: dragRect.y,
+                          width: dragRect.w,
+                          height: dragRect.h,
+                          boxShadow: '0 0 0 9999px rgba(0,0,0,0.55)',
+                        }}
+                      />
+                      {/* 크기 레이블 */}
+                      {cropRegion && (
+                        <div
+                          className="absolute text-xs text-white bg-blue-600 px-1.5 py-0.5 rounded pointer-events-none"
+                          style={{
+                            left: dragRect.x,
+                            top: Math.max(0, dragRect.y - 22),
+                          }}
+                        >
+                          {cropRegion.w}×{cropRegion.h}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    /* 아직 선택 전: 전체 어두운 오버레이 + 안내 */
+                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                      <p className="text-white/70 text-sm pointer-events-none">
+                        드래그하여 크롭 영역을 지정하세요
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 크롭 컨트롤 */}
+            <div className="px-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="text-slate-300 font-medium text-sm">크롭</span>
+                  {cropRegion && (
+                    <span className="text-xs px-2 py-0.5 bg-orange-500/20 border border-orange-500/30 text-orange-300 rounded-full">
+                      {cropRegion.w}×{cropRegion.h}  ({cropRegion.x}, {cropRegion.y})
+                    </span>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  {cropRegion && (
+                    <button
+                      onClick={() => { setCropRegion(null); setDragRect(null) }}
+                      className="text-xs px-2.5 py-1.5 bg-slate-700 hover:bg-red-600/70 text-slate-400 hover:text-white rounded-lg transition-colors"
+                    >
+                      초기화
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      if (cropMode) {
+                        // 완료: 모드 종료
+                        setCropMode(false)
+                      } else {
+                        // 진입: dragRect 초기화 후 모드 활성
+                        setDragRect(cropRegion ? cropRegionToDisplayRect(cropRegion) ?? null : null)
+                        setCropMode(true)
+                      }
+                    }}
+                    className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all ${
+                      cropMode
+                        ? 'bg-orange-600 hover:bg-orange-500 text-white'
+                        : 'bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {cropMode ? '완료' : '영역 지정'}
+                  </button>
+                </div>
+              </div>
+              {cropMode && (
+                <p className="text-slate-500 text-xs mt-1.5">
+                  비디오 위에서 드래그하여 유지할 영역을 선택하세요. 재생 컨트롤은 비활성됩니다.
+                </p>
+              )}
             </div>
 
             {/* D: 구간 선택 */}
@@ -348,7 +585,6 @@ export default function App() {
                     />
                     <button
                       onClick={() => setTrimStart(Math.round((videoRef.current?.currentTime ?? 0) * 10) / 10)}
-                      title="현재 재생 위치로 설정"
                       className="px-2.5 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs rounded-lg border border-slate-600 transition-colors"
                     >
                       현재
@@ -370,7 +606,6 @@ export default function App() {
                     />
                     <button
                       onClick={() => setTrimEnd(Math.round((videoRef.current?.currentTime ?? 0) * 10) / 10)}
-                      title="현재 재생 위치로 설정"
                       className="px-2.5 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs rounded-lg border border-slate-600 transition-colors"
                     >
                       현재
