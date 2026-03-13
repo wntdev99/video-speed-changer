@@ -14,6 +14,22 @@ echo ""
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# ── 기존 프로세스 종료 ─────────────────────────
+# 이전 실행이 남아 있으면 포트 충돌로 새 서버가 시작되지 않음
+kill_existing() {
+  local port=$1 name=$2
+  local pid
+  pid=$(lsof -ti :"$port" 2>/dev/null || true)
+  if [ -n "$pid" ]; then
+    echo "  기존 $name 종료 (PID $pid, 포트 $port)"
+    kill $pid 2>/dev/null
+    sleep 1
+    kill -9 $pid 2>/dev/null || true
+  fi
+}
+kill_existing 8000 "백엔드"
+kill_existing 5173 "프론트엔드"
+
 # ── 백엔드 시작 ──────────────────────────────
 echo "[1/2] 백엔드 패키지 설치 및 실행..."
 cd "$ROOT_DIR/backend"

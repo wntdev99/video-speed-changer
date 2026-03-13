@@ -193,8 +193,8 @@ def _build_ffmpeg_cmd(
     return cmd
 
 
-def _run_ffmpeg_process(job_id: str, cmd: list[str], output_duration: float) -> int:
-    """FFmpeg 프로세스를 실행하고 진행률을 추적한다. returncode를 반환."""
+def _run_ffmpeg_process(job_id: str, cmd: list[str], output_duration: float) -> tuple[int, str]:
+    """FFmpeg 프로세스를 실행하고 진행률을 추적한다. (returncode, stderr_tail)를 반환."""
     process = subprocess.Popen(
         cmd,
         stderr=subprocess.PIPE,
@@ -205,16 +205,20 @@ def _run_ffmpeg_process(job_id: str, cmd: list[str], output_duration: float) -> 
     jobs[job_id]["process"] = process
 
     time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d+)")
+    stderr_lines: list[str] = []
 
     assert process.stderr is not None
     for line in process.stderr:
+        stderr_lines.append(line)
+        if len(stderr_lines) > 30:
+            stderr_lines.pop(0)
         match = time_pattern.search(line)
         if match and output_duration > 0:
             current = parse_time_to_seconds(match.group(1))
             jobs[job_id]["progress"] = min(99, int(current / output_duration * 100))
 
     process.wait()
-    return process.returncode
+    return process.returncode, "".join(stderr_lines[-10:])
 
 
 def run_ffmpeg(
@@ -244,13 +248,13 @@ def run_ffmpeg(
 
         # 1차 시도: 블렌딩 필터 적용 (tmix / minterpolate)
         cmd = _build_ffmpeg_cmd(*build_args, use_blend=True)
-        returncode = _run_ffmpeg_process(job_id, cmd, output_duration)
+        returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
         # 블렌딩 필터 실패 시 단순 setpts 방식으로 폴백
         if returncode != 0 and jobs[job_id]["status"] != "cancelled":
             jobs[job_id]["progress"] = 0
             cmd = _build_ffmpeg_cmd(*build_args, use_blend=False)
-            returncode = _run_ffmpeg_process(job_id, cmd, output_duration)
+            returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
         if returncode == 0:
             jobs[job_id]["status"] = "done"
@@ -262,7 +266,9 @@ def run_ffmpeg(
             jobs[job_id]["status"] = "cancelled"
         else:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "FFmpeg 변환 실패 (returncode={})".format(returncode)
+            jobs[job_id]["error"] = "FFmpeg 실패 (rc={}): {}".format(
+                returncode, stderr_tail.strip()[-200:] if stderr_tail else "unknown"
+            )
 
     except Exception as exc:
         jobs[job_id]["status"] = "error"
