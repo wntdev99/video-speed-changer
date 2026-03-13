@@ -66,11 +66,19 @@ def get_video_duration(path: str) -> float:
         return 0.0
 
 
+def _parse_frame_rate(rate_str: str) -> float:
+    try:
+        num, den = rate_str.split("/")
+        return round(float(num) / float(den), 3) if float(den) != 0 else 0.0
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
 def get_video_info(path: str) -> dict:
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
-            "-show_entries", "stream=width,height,r_frame_rate,codec_name,codec_type",
+            "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,codec_name,codec_type",
             "-show_entries", "format=duration,size",
             "-of", "json",
             path,
@@ -83,18 +91,26 @@ def get_video_info(path: str) -> dict:
     except (json.JSONDecodeError, ValueError):
         return {}
 
+    streams = data.get("streams", [])
     video_stream = next(
-        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        (s for s in streams if s.get("codec_type") == "video"),
         {},
     )
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
     fmt = data.get("format", {})
 
-    fps = 0.0
-    r_frame_rate = video_stream.get("r_frame_rate", "0/1")
-    try:
-        num, den = r_frame_rate.split("/")
-        fps = round(float(num) / float(den), 3) if float(den) != 0 else 0.0
-    except (ValueError, ZeroDivisionError):
+    # fps 결정: r_frame_rate → avg_frame_rate → 30.0 (기본값)
+    # 화면 녹화(VFR)는 r_frame_rate=1000/1 같은 비정상 값을 가질 수 있음
+    r_fps = _parse_frame_rate(video_stream.get("r_frame_rate", "0/1"))
+    avg_fps = _parse_frame_rate(video_stream.get("avg_frame_rate", "0/1"))
+
+    if 1 <= r_fps <= 120:
+        fps = r_fps
+    elif 1 <= avg_fps <= 120:
+        fps = avg_fps
+    elif r_fps > 120 or avg_fps > 120:
+        fps = 30.0  # VFR 영상 — 안전한 기본값
+    else:
         fps = 0.0
 
     return {
@@ -104,6 +120,7 @@ def get_video_info(path: str) -> dict:
         "codec": video_stream.get("codec_name"),
         "duration": float(fmt.get("duration") or 0),
         "size": int(fmt.get("size") or 0),
+        "has_audio": has_audio,
     }
 
 
@@ -147,6 +164,7 @@ def _build_ffmpeg_cmd(
     crop_h: int,
     input_fps: float,
     use_blend: bool,
+    has_audio: bool = True,
 ) -> list[str]:
     """FFmpeg 명령어 리스트를 생성한다.
 
@@ -178,9 +196,13 @@ def _build_ffmpeg_cmd(
     else:
         vf_chain.append(f"setpts=PTS/{speed}")
 
+    # H.264/H.265 인코더는 가로·세로 모두 짝수여야 함
+    # 화면 녹화 등 홀수 해상도 입력에서 인코딩 실패 방지
+    vf_chain.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
+
     cmd.extend(["-vf", ",".join(vf_chain)])
 
-    if speed > 100:
+    if speed > 100 or not has_audio:
         cmd.append("-an")
     else:
         cmd.extend(["-af", build_atempo_filter(speed)])
@@ -235,6 +257,7 @@ def run_ffmpeg(
     crop_w: int = 0,
     crop_h: int = 0,
     input_fps: float = 0.0,
+    has_audio: bool = True,
 ) -> None:
     try:
         input_duration = get_video_duration(input_path)
@@ -245,15 +268,16 @@ def run_ffmpeg(
             input_path, output_path, speed, trim_start, trim_end,
             crf, output_format, crop_x, crop_y, crop_w, crop_h, input_fps,
         )
+        build_kwargs = {"has_audio": has_audio}
 
         # 1차 시도: 블렌딩 필터 적용 (tmix / minterpolate)
-        cmd = _build_ffmpeg_cmd(*build_args, use_blend=True)
+        cmd = _build_ffmpeg_cmd(*build_args, use_blend=True, **build_kwargs)
         returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
         # 블렌딩 필터 실패 시 단순 setpts 방식으로 폴백
         if returncode != 0 and jobs[job_id]["status"] != "cancelled":
             jobs[job_id]["progress"] = 0
-            cmd = _build_ffmpeg_cmd(*build_args, use_blend=False)
+            cmd = _build_ffmpeg_cmd(*build_args, use_blend=False, **build_kwargs)
             returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
         if returncode == 0:
@@ -323,11 +347,12 @@ async def convert_video(
     }
 
     input_fps = video_info.get("fps") or 0.0
+    has_audio = video_info.get("has_audio", True)
 
     thread = threading.Thread(
         target=run_ffmpeg,
         args=(job_id, input_path, output_path, speed, trim_start, trim_end, crf, output_format,
-              crop_x, crop_y, crop_w, crop_h, input_fps),
+              crop_x, crop_y, crop_w, crop_h, input_fps, has_audio),
         daemon=True,
     )
     thread.start()
