@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 type Phase = 'upload' | 'ready' | 'converting' | 'done' | 'error'
 
@@ -363,6 +363,37 @@ export default function App() {
     URL.revokeObjectURL(url)
     fetch(`/api/cleanup/${jobId}`, { method: 'DELETE' }).catch(() => {})
   }
+
+  // 변환 결과 예측 (설정 변경 시 실시간 재계산)
+  const estimatedOutput = useMemo(() => {
+    if (!videoInfo || !videoInfo.duration) return null
+
+    // 길이: trim → speed 순으로 계산
+    const clipDuration =
+      trimEnd > 0
+        ? Math.max(0, trimEnd - trimStart)
+        : Math.max(0, videoInfo.duration - trimStart)
+    const outputDuration = speed > 0 ? clipDuration / speed : clipDuration
+
+    // 해상도: 크롭 적용 여부
+    const outputW = cropRegion ? cropRegion.w : (videoInfo.width ?? 0)
+    const outputH = cropRegion ? cropRegion.h : (videoInfo.height ?? 0)
+
+    // 용량 추정:
+    //   원본 bytes/sec × 출력길이 × CRF보정 × 크롭면적비 × 포맷보정
+    //   CRF: 6 단위마다 약 2배 차이 (H.264 경험 법칙)
+    //   WebM(VP9): 동일 화질에서 H.264 대비 약 40% 절감
+    const bytesPerSec = videoInfo.size / videoInfo.duration
+    const crfFactor = Math.pow(2, (23 - crf) / 6)
+    const cropFactor =
+      cropRegion && videoInfo.width && videoInfo.height
+        ? (cropRegion.w * cropRegion.h) / (videoInfo.width * videoInfo.height)
+        : 1.0
+    const formatFactor = outputFormat === 'webm' ? 0.6 : 1.0
+    const estimatedBytes = bytesPerSec * outputDuration * crfFactor * cropFactor * formatFactor
+
+    return { duration: outputDuration, width: outputW, height: outputH, estimatedBytes }
+  }, [videoInfo, trimStart, trimEnd, speed, cropRegion, crf, outputFormat])
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex flex-col items-center justify-center p-4 py-12">
@@ -752,6 +783,43 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {/* 변환 결과 예측 */}
+            {estimatedOutput && (
+              <div className="rounded-xl bg-slate-700/40 border border-slate-600/50 px-4 py-3 space-y-2">
+                <p className="text-slate-400 text-xs font-medium uppercase tracking-wide">변환 후 예상</p>
+                <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">길이</span>
+                    <span className="text-slate-100 font-medium tabular-nums">
+                      {formatDuration(estimatedOutput.duration)}
+                      {estimatedOutput.duration !== (videoInfo?.duration ?? 0) && (
+                        <span className="text-slate-500 font-normal ml-1.5 text-xs">
+                          (원본 {formatDuration(videoInfo?.duration ?? 0)})
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">해상도</span>
+                    <span className="text-slate-100 font-medium">
+                      {estimatedOutput.width}×{estimatedOutput.height}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">포맷</span>
+                    <span className="text-slate-100 font-medium uppercase">{outputFormat}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">예상 용량</span>
+                    <span className="text-slate-100 font-medium">
+                      ~{formatFileSize(estimatedOutput.estimatedBytes)}
+                      <span className="text-slate-600 font-normal text-xs ml-1">추정</span>
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* 변환 버튼 */}
             <button
