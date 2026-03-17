@@ -843,6 +843,11 @@ export default function App() {
               </div>
             )}
 
+            {/* 에러 메시지 (trim 검증 실패 등) */}
+            {error && (
+              <p className="text-red-400 text-sm text-center bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-2">{error}</p>
+            )}
+
             {/* 변환 버튼 */}
             <button
               onClick={handleConvert}
