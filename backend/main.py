@@ -178,16 +178,22 @@ def _build_ffmpeg_cmd(
         cmd.extend(["-t", str(trim_end - trim_start)])
     cmd.extend(["-i", input_path])
 
-    # 비디오 필터 체인: crop → (블렌딩/보간) → setpts → (fps 정규화)
+    # 비디오 필터 체인: crop → fps(VFR 정규화) → (블렌딩/보간) → setpts → fps(출력 정규화)
     vf_chain: list[str] = []
     if crop_w > 0 and crop_h > 0:
         vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+
+    # VFR(가변 프레임레이트) 입력을 CFR로 정규화 — 화면 녹화 등에서 필수
+    if input_fps > 0:
+        vf_chain.append(f"fps={input_fps}")
 
     if use_blend and speed > 1.0 and speed <= 100 and input_fps > 0:
         # tmix: weights 미지정 시 기본값 전부 1 (공백/따옴표 파싱 문제 회피)
         blend_n = min(32, max(2, round(speed)))
         vf_chain.append(f"tmix=frames={blend_n}")
         vf_chain.append(f"setpts=PTS/{speed}")
+        # setpts 후 출력 프레임레이트 재정규화 — 균일한 프레임 선택 보장
+        vf_chain.append(f"fps={round(input_fps)}")
     elif use_blend and speed < 1.0 and input_fps > 0:
         target_fps = min(120, max(round(input_fps / speed), round(input_fps) * 2))
         vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=blend")
@@ -195,6 +201,9 @@ def _build_ffmpeg_cmd(
         vf_chain.append(f"fps={round(input_fps)}")
     else:
         vf_chain.append(f"setpts=PTS/{speed}")
+        # setpts만 사용할 때도 출력 fps 정규화 — 프레임 드롭 불균일 방지
+        if input_fps > 0:
+            vf_chain.append(f"fps={round(input_fps)}")
 
     # H.264/H.265 인코더는 가로·세로 모두 짝수여야 함
     # 화면 녹화 등 홀수 해상도 입력에서 인코딩 실패 방지
@@ -260,6 +269,10 @@ def run_ffmpeg(
     has_audio: bool = True,
 ) -> None:
     try:
+        # 취소 요청이 이미 들어왔는지 확인 (cancel race condition 방지)
+        if jobs[job_id]["status"] == "cancelled":
+            return
+
         input_duration = get_video_duration(input_path)
         clip_duration = (trim_end - trim_start) if trim_end > 0 else input_duration
         output_duration = clip_duration / speed if speed > 0 else clip_duration
@@ -314,6 +327,15 @@ async def convert_video(
 ) -> dict:
     if speed <= 0 or speed > 1000:
         raise HTTPException(status_code=400, detail="speed는 0 초과 1000 이하여야 합니다.")
+
+    ALLOWED_FORMATS = {"mp4", "mov", "webm"}
+    if output_format not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"output_format은 {ALLOWED_FORMATS} 중 하나여야 합니다.")
+
+    crf = max(0, min(51, crf))
+
+    if trim_end > 0 and trim_end <= trim_start:
+        raise HTTPException(status_code=400, detail="trim_end는 trim_start보다 커야 합니다.")
 
     job_id = str(uuid.uuid4())
     job_dir = TEMP_DIR / job_id
@@ -399,8 +421,12 @@ async def download_file(job_id: str) -> FileResponse:
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="변환이 완료되지 않았습니다.")
 
+    output_path = job.get("output_path")
+    if not output_path or not Path(output_path).exists():
+        raise HTTPException(status_code=404, detail="출력 파일을 찾을 수 없습니다. 이미 정리되었을 수 있습니다.")
+
     return FileResponse(
-        job["output_path"],
+        output_path,
         filename=job["filename"],
         media_type="application/octet-stream",
     )
@@ -412,10 +438,11 @@ async def cancel_job(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = jobs[job_id]
-    process = job.get("process")
-    if process and job["status"] == "processing":
-        process.terminate()
+    if job["status"] == "processing":
         jobs[job_id]["status"] = "cancelled"
+        process = job.get("process")
+        if process:
+            process.terminate()
 
     return {"message": "취소 요청 완료"}
 
