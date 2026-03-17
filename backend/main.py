@@ -285,6 +285,7 @@ def run_ffmpeg(
     crop_h: int = 0,
     input_fps: float = 0.0,
     has_audio: bool = True,
+    high_quality: bool = False,
 ) -> None:
     try:
         # 취소 요청이 이미 들어왔는지 확인 (cancel race condition 방지)
@@ -292,7 +293,9 @@ def run_ffmpeg(
             return
 
         input_duration = get_video_duration(input_path)
-        clip_duration = (trim_end - trim_start) if trim_end > 0 else input_duration
+        # trim_end가 영상 길이를 초과하면 영상 끝으로 제한 (output_duration 계산 오류 방지)
+        effective_trim_end = min(trim_end, input_duration) if trim_end > 0 else trim_end
+        clip_duration = (effective_trim_end - trim_start) if effective_trim_end > 0 else input_duration
         output_duration = clip_duration / speed if speed > 0 else clip_duration
 
         build_args = (
@@ -301,13 +304,17 @@ def run_ffmpeg(
         )
         build_kwargs = {"has_audio": has_audio}
 
-        # 1차 시도: minterpolate 보간 필터 적용
-        cmd = _build_ffmpeg_cmd(*build_args, use_blend=True, **build_kwargs)
-        returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
+        if high_quality:
+            # 고품질: minterpolate 보간 1차 시도 → 실패 시 단순 setpts 폴백
+            cmd = _build_ffmpeg_cmd(*build_args, use_blend=True, **build_kwargs)
+            returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
-        # 블렌딩 필터 실패 시 단순 setpts 방식으로 폴백
-        if returncode != 0 and jobs[job_id]["status"] != "cancelled":
-            jobs[job_id]["progress"] = 0
+            if returncode != 0 and returncode > 0 and jobs[job_id]["status"] != "cancelled":
+                jobs[job_id]["progress"] = 0
+                cmd = _build_ffmpeg_cmd(*build_args, use_blend=False, **build_kwargs)
+                returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
+        else:
+            # 기본(빠른 처리): 단순 setpts+fps 직행, 폴백 없음
             cmd = _build_ffmpeg_cmd(*build_args, use_blend=False, **build_kwargs)
             returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
@@ -342,6 +349,7 @@ async def convert_video(
     crop_y: int = Form(0),
     crop_w: int = Form(0),
     crop_h: int = Form(0),
+    high_quality: bool = Form(False),
 ) -> dict:
     if speed <= 0 or speed > 1000:
         raise HTTPException(status_code=400, detail="speed는 0 초과 1000 이하여야 합니다.")
@@ -392,7 +400,7 @@ async def convert_video(
     thread = threading.Thread(
         target=run_ffmpeg,
         args=(job_id, input_path, output_path, speed, trim_start, trim_end, crf, output_format,
-              crop_x, crop_y, crop_w, crop_h, input_fps, has_audio),
+              crop_x, crop_y, crop_w, crop_h, input_fps, has_audio, high_quality),
         daemon=True,
     )
     thread.start()

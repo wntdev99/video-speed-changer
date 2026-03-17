@@ -75,6 +75,8 @@ export default function App() {
   const [outputFormat, setOutputFormat] = useState<OutputFormat>('mp4')
   // 고급 옵션 접기/펼치기
   const [showAdvanced, setShowAdvanced] = useState(false)
+  // 고품질 변환 (minterpolate 보간)
+  const [highQuality, setHighQuality] = useState(false)
   // 크롭
   const [cropRegion, setCropRegion] = useState<CropRegion | null>(null)
   const [cropMode, setCropMode] = useState(false)
@@ -115,7 +117,7 @@ export default function App() {
       const dr = cropRegionToDisplayRect(cropRegion)
       if (dr) setDragRect(dr)
     }
-  }, [cropMode]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cropMode, cropRegion]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── 크롭 좌표 변환 헬퍼 ───────────────────────────────────────────────────
   // video element는 object-contain이므로 실제 렌더링 영역과 컨테이너가 다를 수 있음
@@ -233,6 +235,10 @@ export default function App() {
       setError('비디오 파일만 지원됩니다. (MP4, MOV, AVI, MKV, WebM 등)')
       return
     }
+    if (f.size === 0) {
+      setError('파일이 비어 있습니다.')
+      return
+    }
     setFile(f)
     const url = URL.createObjectURL(f)
     setVideoUrl(url)
@@ -285,6 +291,7 @@ export default function App() {
     setCropRegion(null)
     setCropMode(false)
     setDragRect(null)
+    setHighQuality(false)
   }
 
   const handleConvert = async () => {
@@ -310,6 +317,7 @@ export default function App() {
       formData.append('crop_w', cropRegion.w.toString())
       formData.append('crop_h', cropRegion.h.toString())
     }
+    formData.append('high_quality', highQuality.toString())
 
     try {
       const res = await fetch('/api/convert', { method: 'POST', body: formData })
@@ -342,6 +350,7 @@ export default function App() {
       }
       es.onerror = () => {
         es.close()
+        eventSourceRef.current = null
         setPhase('error')
         setError('서버 연결이 끊어졌습니다.')
       }
@@ -778,6 +787,24 @@ export default function App() {
                         </button>
                       ))}
                     </div>
+                  </div>
+
+                  {/* 고품질 변환 토글 */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm text-slate-300">고품질 변환</span>
+                      <p className="text-xs text-slate-500 mt-0.5">프레임 보간 적용 · 처리 시간 증가</p>
+                    </div>
+                    <button
+                      onClick={() => setHighQuality(v => !v)}
+                      className={`w-11 h-6 rounded-full transition-colors ${
+                        highQuality ? 'bg-blue-600' : 'bg-slate-600'
+                      }`}
+                    >
+                      <span className={`block w-4 h-4 bg-white rounded-full mx-1 transition-transform ${
+                        highQuality ? 'translate-x-5' : 'translate-x-0'
+                      }`} />
+                    </button>
                   </div>
 
                   {/* E: CRF 슬라이더 */}
