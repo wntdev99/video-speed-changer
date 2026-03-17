@@ -102,6 +102,13 @@ export default function App() {
     }
   }, [videoUrl])
 
+  // EventSource 정리 (언마운트 시 메모리 누수 방지)
+  useEffect(() => {
+    return () => {
+      eventSourceRef.current?.close()
+    }
+  }, [])
+
   // cropMode 진입 시 기존 cropRegion을 displayRect로 복원
   useEffect(() => {
     if (cropMode && cropRegion) {
@@ -282,6 +289,10 @@ export default function App() {
 
   const handleConvert = async () => {
     if (!file) return
+    if (trimEnd > 0 && trimEnd <= trimStart) {
+      setError('종료 시점은 시작 시점보다 커야 합니다.')
+      return
+    }
     setPhase('converting')
     setProgress(0)
     setError(null)
@@ -350,18 +361,29 @@ export default function App() {
   // C: 다운로드 후 서버 파일 자동 정리
   const handleDownload = async () => {
     if (!jobId) return
-    const res = await fetch(`/api/download/${jobId}`)
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const disposition = res.headers.get('content-disposition') ?? ''
-    const match = disposition.match(/filename="?([^"]+)"?/)
-    const filename = match ? match[1] : `output.${outputFormat}`
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
-    fetch(`/api/cleanup/${jobId}`, { method: 'DELETE' }).catch(() => {})
+    try {
+      const res = await fetch(`/api/download/${jobId}`)
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: '다운로드 실패' }))
+        setError(err.detail || '다운로드에 실패했습니다.')
+        setPhase('error')
+        return
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const disposition = res.headers.get('content-disposition') ?? ''
+      const match = disposition.match(/filename="?([^"]+)"?/)
+      const filename = match ? match[1] : `output.${outputFormat}`
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(url)
+      fetch(`/api/cleanup/${jobId}`, { method: 'DELETE' }).catch(() => {})
+    } catch {
+      setError('다운로드 중 네트워크 오류가 발생했습니다.')
+      setPhase('error')
+    }
   }
 
   // 변환 결과 예측 (설정 변경 시 실시간 재계산)
