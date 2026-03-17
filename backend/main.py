@@ -113,13 +113,23 @@ def get_video_info(path: str) -> dict:
     else:
         fps = 0.0
 
+    try:
+        duration = float(fmt.get("duration") or 0)
+    except (ValueError, TypeError):
+        duration = 0.0
+
+    try:
+        size = int(fmt.get("size") or 0)
+    except (ValueError, TypeError):
+        size = 0
+
     return {
         "width": video_stream.get("width"),
         "height": video_stream.get("height"),
         "fps": fps,
         "codec": video_stream.get("codec_name"),
-        "duration": float(fmt.get("duration") or 0),
-        "size": int(fmt.get("size") or 0),
+        "duration": duration,
+        "size": size,
         "has_audio": has_audio,
     }
 
@@ -168,8 +178,12 @@ def _build_ffmpeg_cmd(
 ) -> list[str]:
     """FFmpeg 명령어 리스트를 생성한다.
 
-    use_blend=True 이면 tmix/minterpolate 블렌딩 필터를 적용하고,
-    False 이면 단순 setpts 방식(폴백)으로 구성한다.
+    가속(speed > 1.0):
+      use_blend=True  → minterpolate(사전 보간) → setpts → fps  [공식 방식]
+      use_blend=False → setpts → fps  [폴백]
+    감속(speed < 1.0):
+      use_blend=True  → setpts → minterpolate  [공식 방식]
+      use_blend=False → setpts → fps  [폴백]
     """
     cmd = ["ffmpeg"]
     if trim_start > 0:
@@ -178,7 +192,7 @@ def _build_ffmpeg_cmd(
         cmd.extend(["-t", str(trim_end - trim_start)])
     cmd.extend(["-i", input_path])
 
-    # 비디오 필터 체인: crop → fps(VFR 정규화) → (블렌딩/보간) → setpts → fps(출력 정규화)
+    # 비디오 필터 체인: crop → fps(VFR 정규화) → setpts → (minterpolate|fps)
     vf_chain: list[str] = []
     if crop_w > 0 and crop_h > 0:
         vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
@@ -187,23 +201,26 @@ def _build_ffmpeg_cmd(
     if input_fps > 0:
         vf_chain.append(f"fps={input_fps}")
 
-    if use_blend and speed > 1.0 and speed <= 100 and input_fps > 0:
-        # tmix: weights 미지정 시 기본값 전부 1 (공백/따옴표 파싱 문제 회피)
-        blend_n = min(32, max(2, round(speed)))
-        vf_chain.append(f"tmix=frames={blend_n}")
-        vf_chain.append(f"setpts=PTS/{speed}")
-        # setpts 후 출력 프레임레이트 재정규화 — 균일한 프레임 선택 보장
-        vf_chain.append(f"fps={round(input_fps)}")
-    elif use_blend and speed < 1.0 and input_fps > 0:
-        target_fps = min(120, max(round(input_fps / speed), round(input_fps) * 2))
-        vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=blend")
-        vf_chain.append(f"setpts=PTS/{speed}")
-        vf_chain.append(f"fps={round(input_fps)}")
+    if input_fps > 0:
+        if use_blend and speed > 1.0 and speed <= 8.0:
+            # 가속 (공식 방식): minterpolate 사전 보간 → setpts → fps
+            # 가속 전에 중간 프레임을 먼저 생성해 버리는 프레임을 모두 보간된 프레임으로 대체
+            # mi_mode=mci: 모션 보상 보간 (optical flow 기반)
+            # speed > 8 이상은 보간 후 드롭 비율이 너무 커 효과가 없으므로 폴백 사용
+            pre_interp_fps = min(120.0, input_fps * speed)
+            vf_chain.append(f"minterpolate=fps={pre_interp_fps}:mi_mode=mci")
+            vf_chain.append(f"setpts=PTS/{speed}")
+            vf_chain.append(f"fps={input_fps}")
+        elif use_blend and speed < 1.0:
+            # 감속: setpts → minterpolate (모션 보상 보간)
+            vf_chain.append(f"setpts=PTS/{speed}")
+            vf_chain.append(f"minterpolate=fps={input_fps}:mi_mode=mci")
+        else:
+            # 폴백: setpts → fps (균일한 프레임 선택)
+            vf_chain.append(f"setpts=PTS/{speed}")
+            vf_chain.append(f"fps={input_fps}")
     else:
         vf_chain.append(f"setpts=PTS/{speed}")
-        # setpts만 사용할 때도 출력 fps 정규화 — 프레임 드롭 불균일 방지
-        if input_fps > 0:
-            vf_chain.append(f"fps={round(input_fps)}")
 
     # H.264/H.265 인코더는 가로·세로 모두 짝수여야 함
     # 화면 녹화 등 홀수 해상도 입력에서 인코딩 실패 방지
@@ -283,7 +300,7 @@ def run_ffmpeg(
         )
         build_kwargs = {"has_audio": has_audio}
 
-        # 1차 시도: 블렌딩 필터 적용 (tmix / minterpolate)
+        # 1차 시도: minterpolate 보간 필터 적용
         cmd = _build_ffmpeg_cmd(*build_args, use_blend=True, **build_kwargs)
         returncode, stderr_tail = _run_ffmpeg_process(job_id, cmd, output_duration)
 
