@@ -178,11 +178,11 @@ def _build_ffmpeg_cmd(
 ) -> list[str]:
     """FFmpeg 명령어 리스트를 생성한다.
 
-    가속(speed > 1.0):
-      use_blend=True  → minterpolate(사전 보간) → setpts → fps  [공식 방식]
+    가속(speed > 1.0, speed <= 8.0):
+      use_blend=True  → minterpolate(blend 사전 보간) → setpts → fps
       use_blend=False → setpts → fps  [폴백]
     감속(speed < 1.0):
-      use_blend=True  → setpts → minterpolate  [공식 방식]
+      use_blend=True  → setpts → minterpolate(blend 보간)
       use_blend=False → setpts → fps  [폴백]
     """
     cmd = ["ffmpeg"]
@@ -205,16 +205,17 @@ def _build_ffmpeg_cmd(
         if use_blend and speed > 1.0 and speed <= 8.0:
             # 가속 (공식 방식): minterpolate 사전 보간 → setpts → fps
             # 가속 전에 중간 프레임을 먼저 생성해 버리는 프레임을 모두 보간된 프레임으로 대체
-            # mi_mode=mci: 모션 보상 보간 (optical flow 기반)
+            # mi_mode=blend: 단방향 블렌딩 — 내부 버퍼 없이 즉시 출력 (진행률 정상 동작)
+            # mi_mode=mci(양방향 모션 추정)는 미래 프레임 버퍼링으로 진행률이 0%에 고착됨
             # speed > 8 이상은 보간 후 드롭 비율이 너무 커 효과가 없으므로 폴백 사용
             pre_interp_fps = min(120.0, input_fps * speed)
-            vf_chain.append(f"minterpolate=fps={pre_interp_fps}:mi_mode=mci")
+            vf_chain.append(f"minterpolate=fps={pre_interp_fps}:mi_mode=blend")
             vf_chain.append(f"setpts=PTS/{speed}")
             vf_chain.append(f"fps={input_fps}")
         elif use_blend and speed < 1.0:
-            # 감속: setpts → minterpolate (모션 보상 보간)
+            # 감속: setpts → minterpolate 블렌딩 보간
             vf_chain.append(f"setpts=PTS/{speed}")
-            vf_chain.append(f"minterpolate=fps={input_fps}:mi_mode=mci")
+            vf_chain.append(f"minterpolate=fps={input_fps}:mi_mode=blend")
         else:
             # 폴백: setpts → fps (균일한 프레임 선택)
             vf_chain.append(f"setpts=PTS/{speed}")
