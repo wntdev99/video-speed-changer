@@ -178,16 +178,22 @@ def _build_ffmpeg_cmd(
         cmd.extend(["-t", str(trim_end - trim_start)])
     cmd.extend(["-i", input_path])
 
-    # 비디오 필터 체인: crop → (블렌딩/보간) → setpts → (fps 정규화)
+    # 비디오 필터 체인: crop → fps(VFR 정규화) → (블렌딩/보간) → setpts → fps(출력 정규화)
     vf_chain: list[str] = []
     if crop_w > 0 and crop_h > 0:
         vf_chain.append(f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}")
+
+    # VFR(가변 프레임레이트) 입력을 CFR로 정규화 — 화면 녹화 등에서 필수
+    if input_fps > 0:
+        vf_chain.append(f"fps={input_fps}")
 
     if use_blend and speed > 1.0 and speed <= 100 and input_fps > 0:
         # tmix: weights 미지정 시 기본값 전부 1 (공백/따옴표 파싱 문제 회피)
         blend_n = min(32, max(2, round(speed)))
         vf_chain.append(f"tmix=frames={blend_n}")
         vf_chain.append(f"setpts=PTS/{speed}")
+        # setpts 후 출력 프레임레이트 재정규화 — 균일한 프레임 선택 보장
+        vf_chain.append(f"fps={round(input_fps)}")
     elif use_blend and speed < 1.0 and input_fps > 0:
         target_fps = min(120, max(round(input_fps / speed), round(input_fps) * 2))
         vf_chain.append(f"minterpolate=fps={target_fps}:mi_mode=blend")
@@ -195,6 +201,9 @@ def _build_ffmpeg_cmd(
         vf_chain.append(f"fps={round(input_fps)}")
     else:
         vf_chain.append(f"setpts=PTS/{speed}")
+        # setpts만 사용할 때도 출력 fps 정규화 — 프레임 드롭 불균일 방지
+        if input_fps > 0:
+            vf_chain.append(f"fps={round(input_fps)}")
 
     # H.264/H.265 인코더는 가로·세로 모두 짝수여야 함
     # 화면 녹화 등 홀수 해상도 입력에서 인코딩 실패 방지
